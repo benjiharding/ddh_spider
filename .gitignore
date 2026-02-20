@@ -1,0 +1,5 @@
+*png
+*json
+testing/*
+.ipynb_checkpoints/*
+__pycache__/*
