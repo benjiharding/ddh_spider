@@ -25,6 +25,18 @@ price_dict = {
 # number of previous days to consider
 n_previous_days = 0  # today
 
+
+def load_intercepts(path):
+    """Load exported intercepts and skip empty spider yields."""
+    with open(path, "r") as f:
+        intercepts = json.load(f)
+
+    rows = [item for item in intercepts if item]
+    if len(rows) == 0:
+        return pd.DataFrame()
+
+    return pd.concat([pd.DataFrame.from_dict(item) for item in rows], ignore_index=True)
+
 # is today a weekday?
 today = datetime.now()
 is_weekday = today.isoweekday() in range(1, 6)
@@ -66,13 +78,9 @@ if is_weekday:
     process.start()
 
     # load json output and plot DataFrame
-    with open("significant_intercepts.json", "r") as f:
-        intercepts = json.load(f)
-    dfs = []
-    for ints in intercepts:
-        df = pd.DataFrame.from_dict(ints)
-        dfs = dfs + [df]
-    df = pd.concat(dfs, ignore_index=True)
+    df = load_intercepts("significant_intercepts.json")
+    if df.empty:
+        raise RuntimeError("No significant intercepts found for the configured date range.")
     fig, ax = DrillholeDataSpider.plot_scatter(df)
 
     # send the email

@@ -71,18 +71,25 @@ class DrillholeDataSpider(scrapy.Spider):
         item_page = response.css("div.item-page")
         info = item_page.css("div.js-tag-info a::text").getall()
         info = [x.strip() for x in info]
-        ticker = info[-2]
+        ticker = info[-2] if len(info) >= 2 else None
         links = item_page.css("div.js-tag-info a::attr(href)").getall()
-        web = [x for x in links if "html" not in x][0]
+        web = next((x for x in links if "html" not in x), None)
         return ticker, web
 
     def parse_stock_quote(self, response):
         """parse article financial information"""
         quotes = response.css("table.stock-quote-module").get()
-        quotes = pd.concat(pd.read_html(quotes), ignore_index=True)
+        if quotes is None:
+            return None, None
+
+        quote_tables = self._safe_read_html(quotes)
+        if len(quote_tables) == 0:
+            return None, None
+
+        quotes = pd.concat(quote_tables, ignore_index=True)
         quotes = quotes.set_index(0)
-        last_trade = quotes.loc["Last Trade:", 1]
-        market_cap = quotes.loc["Market Cap:", 1]
+        last_trade = quotes.loc["Last Trade:", 1] if "Last Trade:" in quotes.index else None
+        market_cap = quotes.loc["Market Cap:", 1] if "Market Cap:" in quotes.index else None
         return last_trade, market_cap
 
     def parse_tabular_intervals(self, response):
@@ -96,8 +103,18 @@ class DrillholeDataSpider(scrapy.Spider):
         # check the tables for ddh data and process them
         dfs = []
         for tab in tables:
-            html = tab.get()
-            if html is None:
+            table_html = tab.get()
+            if table_html is None:
+                continue
+
+            parsed_tables = self._safe_read_html(table_html.replace(",", "."), header=0)
+            if len(parsed_tables) == 0:
+                continue
+
+            table = pd.concat(parsed_tables, ignore_index=True)
+            cols = table.columns
+            ddh_related = fnmatch.filter(cols, "from*")
+            if len(ddh_related) == 0:
                 continue
 
             candidates = []
@@ -119,7 +136,6 @@ class DrillholeDataSpider(scrapy.Spider):
         if len(dfs) == 0:  # no ddh related tables
             return self.parse_unstructured_intervals(response)
         else:
-            # TODO check if tables are the same shape before concat
             df = pd.concat(dfs, ignore_index=True)
             df = df.dropna(how="all")
             return df
@@ -258,8 +274,6 @@ class DrillholeDataSpider(scrapy.Spider):
             sig_ints["article_date"] = date
             sig_ints["article_link"] = link
             yield sig_ints
-        else:
-            yield None
 
     def calc_significant_intercepts(self, df, price_dict):
         """
@@ -267,6 +281,7 @@ class DrillholeDataSpider(scrapy.Spider):
         robust column identification instead of manual junk lists.
         """
 
+        df = df.copy()
         all_cols = df.columns
 
         # --- helpers -------------------------------------------------
@@ -535,3 +550,11 @@ class DrillholeDataSpider(scrapy.Spider):
         col = re.sub(r"[^\w\s%/\.]", " ", col)
         col = re.sub(r"\s+", " ", col).strip()
         return col
+
+    @staticmethod
+    def _safe_read_html(html, **kwargs):
+        """Read html tables and return an empty list on parser errors."""
+        try:
+            return pd.read_html(html, **kwargs)
+        except ValueError:
+            return []
