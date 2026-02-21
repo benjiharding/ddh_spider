@@ -9,6 +9,7 @@ import re
 import seaborn as sns
 
 from datetime import datetime, date
+from urllib.parse import urlparse
 
 mpl.rcParams["axes.facecolor"] = "0.95"
 
@@ -25,6 +26,8 @@ class DrillholeDataSpider(scrapy.Spider):
         self.n_previous_days = n_previous_days
         self.today = date.today()
         self.page = 1
+        self.article_audit_log = []
+        self.audit_log_path = "article_parse_audit.json"
         logger = logging.getLogger("matplotlib")  # supress mpl INFO output to terminal
         logger.setLevel(logging.ERROR)
 
@@ -43,17 +46,38 @@ class DrillholeDataSpider(scrapy.Spider):
 
         # parse articles if they are within the date range
         for article in articles:
-            date = datetime.strptime(
-                article["formatted_date"].strip(), "%B %d, %Y"
-            ).date()
+            raw_date = article.get("formatted_date")
+            raw_link = article.get("link")
+
+            try:
+                date = datetime.strptime(raw_date.strip(), "%B %d, %Y").date()
+            except (AttributeError, ValueError):
+                self._record_article_status(
+                    status="failed",
+                    reason="invalid_article_date",
+                    article_link=raw_link,
+                    article_date=raw_date,
+                )
+                continue
+
             delta = (self.today - date).days
             if delta <= self.n_previous_days:
-                url = response.urljoin(article["link"])
+                url = response.urljoin(raw_link) if raw_link else None
+                if not self._is_valid_url(url):
+                    self._record_article_status(
+                        status="failed",
+                        reason="invalid_article_url",
+                        article_link=raw_link,
+                        article_date=raw_date,
+                    )
+                    continue
+
                 yield scrapy.Request(
                     url,
                     callback=self.parse_article,
+                    errback=self.handle_article_error,
                     cb_kwargs={
-                        "date": article["formatted_date"],
+                        "date": raw_date,
                         "link": url,
                     },
                 )
@@ -125,6 +149,7 @@ class DrillholeDataSpider(scrapy.Spider):
             for table in candidates:
                 table = self._clean_interval_table(table)
                 if self._is_interval_table(table):
+                    table["parse_source"] = "table_html"
                     dfs.append(table)
 
         if len(dfs) == 0:  # no ddh related tables
@@ -251,12 +276,31 @@ class DrillholeDataSpider(scrapy.Spider):
         last_trade, market_cap = self.parse_stock_quote(full_page)
         intervals = self.parse_tabular_intervals(item_page)
 
-        if intervals is not None:
-            sig_ints, commod = self.calc_significant_intercepts(
-                intervals, self.price_dict
+        has_valid_tabular_data = (
+            intervals is not None
+            and "parse_source" in intervals.columns
+            and (intervals["parse_source"] == "table_html").any()
+        )
+
+        if intervals is None:
+            self._record_article_status(
+                status="failed",
+                reason="no_interval_data_extracted",
+                article_link=link,
+                article_date=date,
             )
-        else:
-            sig_ints = None
+            return
+
+        sig_ints, commod = self.calc_significant_intercepts(intervals, self.price_dict)
+
+        if sig_ints is None and has_valid_tabular_data:
+            self._record_article_status(
+                status="non_significant",
+                reason="valid_tabular_data_below_significance_threshold",
+                article_link=link,
+                article_date=date,
+            )
+            return
 
         if sig_ints is not None:
             sig_ints = sig_ints.to_dict()  # scrapy needs a dictionary
@@ -268,6 +312,45 @@ class DrillholeDataSpider(scrapy.Spider):
             sig_ints["article_date"] = date
             sig_ints["article_link"] = link
             yield sig_ints
+
+
+    def handle_article_error(self, failure):
+        """Capture request/response level failures for article pages."""
+        req = failure.request
+        self._record_article_status(
+            status="failed",
+            reason="request_error",
+            article_link=req.url,
+            article_date=req.cb_kwargs.get("date"),
+            details=str(failure.value),
+        )
+
+    def closed(self, reason):
+        """Write article parsing audit records at spider shutdown."""
+        with open(self.audit_log_path, "w") as f:
+            json.dump(self.article_audit_log, f, indent=4)
+
+    def _record_article_status(
+        self, status, reason, article_link=None, article_date=None, details=None
+    ):
+        record = {
+            "status": status,
+            "reason": reason,
+            "article_link": article_link,
+            "article_date": article_date,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        }
+        if details is not None:
+            record["details"] = details
+
+        self.article_audit_log.append(record)
+
+    @staticmethod
+    def _is_valid_url(url):
+        if not url:
+            return False
+        parsed = urlparse(url)
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
     def calc_significant_intercepts(self, df, price_dict):
         """
