@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
-import fnmatch
 import json
 import logging
 import re
@@ -99,7 +98,7 @@ class DrillholeDataSpider(scrapy.Spider):
         # get the part of the page with the tabular data
         tables = response.css("table")
         if len(tables) == 0:
-            return None
+            return self.parse_unstructured_intervals(response)
 
         # check the tables for ddh data and process them
         dfs = []
@@ -117,14 +116,129 @@ class DrillholeDataSpider(scrapy.Spider):
             ddh_related = fnmatch.filter(cols, "from*")
             if len(ddh_related) == 0:
                 continue
-            dfs.append(table)
+
+            candidates = []
+            try:
+                candidates = pd.read_html(html.replace(",", "."), header=0)
+            except ValueError:
+                candidates = []
+
+            if len(candidates) == 0:
+                fallback_table = self._manual_parse_html_table(tab)
+                if fallback_table is not None:
+                    candidates = [fallback_table]
+
+            for table in candidates:
+                table = self._clean_interval_table(table)
+                if self._is_interval_table(table):
+                    dfs.append(table)
 
         if len(dfs) == 0:  # no ddh related tables
-            return None
+            return self.parse_unstructured_intervals(response)
         else:
             df = pd.concat(dfs, ignore_index=True)
             df = df.dropna(how="all")
             return df
+
+    def _clean_interval_table(self, df):
+        """Standardize columns and strip empty records from parsed tables."""
+        table = df.copy()
+        table.columns = [self._normalize(str(c)) for c in table.columns]
+
+        for col in table.columns:
+            if table[col].dtype == object:
+                table[col] = table[col].astype(str).str.strip()
+                table[col] = table[col].replace({"": np.nan, "nan": np.nan})
+
+        table = table.dropna(how="all")
+        return table
+
+    def _manual_parse_html_table(self, tab):
+        """Fallback parser that builds a DataFrame from <tr>/<th>/<td> cells."""
+        rows = tab.css("tr")
+        if len(rows) == 0:
+            return None
+
+        extracted = []
+        for row in rows:
+            cells = row.css("th::text, td::text").getall()
+            cells = [c.strip() for c in cells if c.strip()]
+            if len(cells) > 0:
+                extracted.append(cells)
+
+        if len(extracted) < 2:
+            return None
+
+        widths = [len(r) for r in extracted]
+        n_cols = max(widths)
+        header_idx = widths.index(n_cols)
+
+        header = extracted[header_idx]
+        if len(header) < 2:
+            return None
+
+        body = []
+        for r in extracted[header_idx + 1 :]:
+            padded = r + [None] * (n_cols - len(r))
+            body.append(padded[:n_cols])
+
+        if len(body) == 0:
+            return None
+
+        return pd.DataFrame(body, columns=header)
+
+    def _is_interval_table(self, df):
+        """Heuristic check for interval tables (from/to + at least one grade-like column)."""
+        cols = list(df.columns)
+        norm_cols = [self._normalize(str(c)) for c in cols]
+
+        from_cols = [c for c in norm_cols if c.startswith("from")]
+        to_cols = [c for c in norm_cols if c.startswith("to")]
+        length_cols = [
+            c
+            for c in norm_cols
+            if any(token in c for token in ["interval", "length", "width"])
+        ]
+
+        grade_like = [
+            c
+            for c in norm_cols
+            if re.search(r"\b(au|ag|pt|pd|cu|zn|pb|ni|co|mo|u308)\b", c, re.I)
+        ]
+
+        has_depth = (len(from_cols) > 0 and len(to_cols) > 0) or len(length_cols) > 0
+        return has_depth and len(grade_like) > 0
+
+    def parse_unstructured_intervals(self, response):
+        """Regex fallback for unstructured interval text."""
+        text = " ".join(response.css("p ::text, li ::text").getall())
+        text = re.sub(r"\s+", " ", text)
+
+        pattern = re.compile(
+            r"from\s*(?P<from>\d+(?:\.\d+)?)\s*(?:m|meters?)\s*"
+            r"(?:to|-)+\s*(?P<to>\d+(?:\.\d+)?)\s*(?:m|meters?).{0,80}?"
+            r"(?P<grade>\d+(?:\.\d+)?)\s*(?P<unit>g/t|gpt|%|ppm|ppb)\s*"
+            r"(?P<elem>Au|Ag|Pt|Pd|Cu|Zn|Pb|Ni|Co|Mo|U308)",
+            re.IGNORECASE,
+        )
+
+        records = []
+        for m in pattern.finditer(text):
+            start = float(m.group("from"))
+            end = float(m.group("to"))
+            records.append(
+                {
+                    "from": start,
+                    "to": end,
+                    "length": end - start,
+                    f"{m.group('elem')} ({m.group('unit')})": float(m.group("grade")),
+                    "parse_source": "regex_text",
+                }
+            )
+
+        if len(records) == 0:
+            return None
+        return pd.DataFrame(records)
 
     def parse_tabular_drillholes(self, response):
         """parse tabular drillhole data (survey and collars) from the article"""
