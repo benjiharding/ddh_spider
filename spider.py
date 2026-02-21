@@ -73,7 +73,7 @@ class DrillholeDataSpider(scrapy.Spider):
                     continue
 
                 yield scrapy.Request(
-                    url,
+                    url=url,
                     callback=self.parse_article,
                     errback=self.handle_article_error,
                     cb_kwargs={
@@ -135,11 +135,7 @@ class DrillholeDataSpider(scrapy.Spider):
             if table_html is None:
                 continue
 
-            candidates = []
-            try:
-                candidates = pd.read_html(table_html.replace(",", "."), header=0)
-            except ValueError:
-                candidates = []
+            candidates = self._safe_read_html(table_html.replace(",", "."), header=0)
 
             if len(candidates) == 0:
                 fallback_table = self._manual_parse_html_table(tab)
@@ -312,7 +308,6 @@ class DrillholeDataSpider(scrapy.Spider):
             sig_ints["article_date"] = date
             sig_ints["article_link"] = link
             yield sig_ints
-
 
     def handle_article_error(self, failure):
         """Capture request/response level failures for article pages."""
