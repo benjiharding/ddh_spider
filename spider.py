@@ -88,8 +88,12 @@ class DrillholeDataSpider(scrapy.Spider):
 
         quotes = pd.concat(quote_tables, ignore_index=True)
         quotes = quotes.set_index(0)
-        last_trade = quotes.loc["Last Trade:", 1] if "Last Trade:" in quotes.index else None
-        market_cap = quotes.loc["Market Cap:", 1] if "Market Cap:" in quotes.index else None
+        last_trade = (
+            quotes.loc["Last Trade:", 1] if "Last Trade:" in quotes.index else None
+        )
+        market_cap = (
+            quotes.loc["Market Cap:", 1] if "Market Cap:" in quotes.index else None
+        )
         return last_trade, market_cap
 
     def parse_tabular_intervals(self, response):
@@ -107,19 +111,9 @@ class DrillholeDataSpider(scrapy.Spider):
             if table_html is None:
                 continue
 
-            parsed_tables = self._safe_read_html(table_html.replace(",", "."), header=0)
-            if len(parsed_tables) == 0:
-                continue
-
-            table = pd.concat(parsed_tables, ignore_index=True)
-            cols = table.columns
-            ddh_related = fnmatch.filter(cols, "from*")
-            if len(ddh_related) == 0:
-                continue
-
             candidates = []
             try:
-                candidates = pd.read_html(html.replace(",", "."), header=0)
+                candidates = pd.read_html(table_html.replace(",", "."), header=0)
             except ValueError:
                 candidates = []
 
