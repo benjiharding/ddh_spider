@@ -257,8 +257,190 @@ class DrillholeDataSpider(scrapy.Spider):
 
     def parse_tabular_drillholes(self, response):
         """parse tabular drillhole data (survey and collars) from the article"""
-        # TODO
-        pass
+        tables = response.css("table")
+        if len(tables) == 0:
+            return None
+
+        ddh_frames = []
+        for tab in tables:
+            table_html = tab.get()
+            if table_html is None:
+                continue
+
+            candidates = self._safe_read_html(table_html.replace(",", "."), header=0)
+            if len(candidates) == 0:
+                fallback_table = self._manual_parse_html_table(tab)
+                if fallback_table is not None:
+                    candidates = [fallback_table]
+
+            for table in candidates:
+                table = self._clean_interval_table(table)
+                if self._is_drillhole_table(table):
+                    ddh_frames.append(self._standardize_drillhole_table(table))
+
+        if len(ddh_frames) == 0:
+            return None
+
+        df_ddh = pd.concat(ddh_frames, ignore_index=True)
+        df_ddh = df_ddh.dropna(subset=["hole_id"], how="any")
+        df_ddh = df_ddh.drop_duplicates(subset=["hole_id"], keep="first")
+
+        numeric_cols = ["azimuth", "inclination", "easting", "northing", "elevation"]
+        for col in numeric_cols:
+            if col in df_ddh.columns:
+                df_ddh[col] = pd.to_numeric(df_ddh[col], errors="coerce")
+
+        return df_ddh if len(df_ddh) > 0 else None
+
+    def _is_drillhole_table(self, df):
+        """Heuristic check for collar/survey tables with spatial drillhole fields."""
+        cols = [self._normalize(str(c)) for c in df.columns]
+
+        has_hole = any("hole id" in c or c == "hole" for c in cols)
+        has_orientation = any("azimuth" in c or "bearing" in c for c in cols) and any(
+            any(token in c for token in ["dip", "inclination", "incl"])
+            for c in cols
+        )
+        has_xy = any("easting" in c or c in {"x", "xcoord"} for c in cols) and any(
+            "northing" in c or c in {"y", "ycoord"} for c in cols
+        )
+
+        return has_hole and (has_orientation or has_xy)
+
+    def _standardize_drillhole_table(self, df):
+        """Rename drillhole table columns to canonical names used downstream."""
+        table = df.copy()
+
+        rename_map = {}
+        for col in table.columns:
+            ncol = self._normalize(str(col))
+
+            if "hole id" in ncol or ncol == "hole":
+                rename_map[col] = "hole_id"
+            elif "azimuth" in ncol or "bearing" in ncol:
+                rename_map[col] = "azimuth"
+            elif any(token in ncol for token in ["inclination", "dip", "incl"]):
+                rename_map[col] = "inclination"
+            elif "easting" in ncol or ncol in {"x", "xcoord"}:
+                rename_map[col] = "easting"
+            elif "northing" in ncol or ncol in {"y", "ycoord"}:
+                rename_map[col] = "northing"
+            elif "elevation" in ncol or "rl" == ncol:
+                rename_map[col] = "elevation"
+
+        table = table.rename(columns=rename_map)
+
+        keep = [
+            c
+            for c in ["hole_id", "azimuth", "inclination", "easting", "northing", "elevation"]
+            if c in table.columns
+        ]
+        table = table[keep]
+
+        if "hole_id" in table.columns:
+            table["hole_id"] = table["hole_id"].astype(str).str.strip()
+            table["hole_id"] = table["hole_id"].replace({"": np.nan, "nan": np.nan})
+
+        return table
+
+    def merge_significant_intervals_with_drillholes(
+        self, df_ddh, intervals_df, significant_df, depth_tolerance=1e-3
+    ):
+        """
+        Join significant grade intervals to drillhole collar/orientation data and
+        desurvey from/to downhole depths into XYZ coordinates.
+        """
+        if df_ddh is None or intervals_df is None or significant_df is None:
+            return None
+
+        if len(df_ddh) == 0 or len(intervals_df) == 0 or len(significant_df) == 0:
+            return None
+
+        intervals = intervals_df.copy()
+        significant = significant_df.copy()
+
+        if "hole_id" not in intervals.columns:
+            hole_cols = [
+                c
+                for c in intervals.columns
+                if self._normalize(str(c)) in {"hole id", "holeid", "hole"}
+            ]
+            if len(hole_cols) > 0:
+                intervals = intervals.rename(columns={hole_cols[0]: "hole_id"})
+
+        required = {"hole_id", "from", "to", "AuEQ"}
+        if not required.issubset(set(intervals.columns)):
+            return None
+
+        if not {"from", "to", "AuEQ"}.issubset(set(significant.columns)):
+            return None
+
+        for col in ["from", "to", "AuEQ"]:
+            intervals[col] = pd.to_numeric(intervals[col], errors="coerce")
+            significant[col] = pd.to_numeric(significant[col], errors="coerce")
+
+        intervals["hole_id"] = intervals["hole_id"].astype(str).str.strip()
+
+        sig_keys = significant[["from", "to", "AuEQ"]].dropna().drop_duplicates()
+        intervals["_k_from"] = np.round(intervals["from"], 3)
+        intervals["_k_to"] = np.round(intervals["to"], 3)
+        intervals["_k_au"] = np.round(intervals["AuEQ"], 3)
+        sig_keys["_k_from"] = np.round(sig_keys["from"], 3)
+        sig_keys["_k_to"] = np.round(sig_keys["to"], 3)
+        sig_keys["_k_au"] = np.round(sig_keys["AuEQ"], 3)
+
+        sig_intervals = intervals.merge(
+            sig_keys[["_k_from", "_k_to", "_k_au"]],
+            on=["_k_from", "_k_to", "_k_au"],
+            how="inner",
+        ).drop(columns=["_k_from", "_k_to", "_k_au"])
+
+        merged = sig_intervals.merge(df_ddh, on="hole_id", how="inner")
+        if len(merged) == 0:
+            return None
+
+        for col in ["from", "to", "azimuth", "inclination", "easting", "northing", "elevation"]:
+            if col in merged.columns:
+                merged[col] = pd.to_numeric(merged[col], errors="coerce")
+
+        merged = merged.dropna(
+            subset=["from", "to", "azimuth", "inclination", "easting", "northing"]
+        )
+        if len(merged) == 0:
+            return None
+
+        az = np.deg2rad(merged["azimuth"])
+        dip = np.deg2rad(merged["inclination"])
+
+        cos_dip = np.cos(dip)
+        sin_dip = np.sin(dip)
+
+        merged["x_from"] = merged["easting"] + merged["from"] * cos_dip * np.sin(az)
+        merged["y_from"] = merged["northing"] + merged["from"] * cos_dip * np.cos(az)
+        merged["z_from"] = merged.get("elevation", 0.0) + merged["from"] * sin_dip
+
+        merged["x_to"] = merged["easting"] + merged["to"] * cos_dip * np.sin(az)
+        merged["y_to"] = merged["northing"] + merged["to"] * cos_dip * np.cos(az)
+        merged["z_to"] = merged.get("elevation", 0.0) + merged["to"] * sin_dip
+
+        out_cols = [
+            c
+            for c in [
+                "hole_id",
+                "from",
+                "to",
+                "AuEQ",
+                "x_from",
+                "y_from",
+                "z_from",
+                "x_to",
+                "y_to",
+                "z_to",
+            ]
+            if c in merged.columns
+        ]
+
+        return merged[out_cols].reset_index(drop=True)
 
     def parse_article(self, response, date, link):
         """parse article information and yield requested tables"""
@@ -454,8 +636,15 @@ class DrillholeDataSpider(scrapy.Spider):
 
         sig_ints = equivalent.loc[
             equivalent["AuEQ*length"] >= 75,
-            ["length", "AuEQ"],
+            [c for c in ["hole_id", ifrom[0], ito[0], "length", "AuEQ"] if c in equivalent.columns],
         ].copy()
+
+        rename_map = {}
+        if len(ifrom) > 0 and ifrom[0] in sig_ints.columns:
+            rename_map[ifrom[0]] = "from"
+        if len(ito) > 0 and ito[0] in sig_ints.columns:
+            rename_map[ito[0]] = "to"
+        sig_ints = sig_ints.rename(columns=rename_map)
 
         sig_ints = sig_ints.reset_index(drop=True)
 
